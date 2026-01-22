@@ -1,200 +1,193 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/shape.h> // Обязательно для ShapeInput
 #include <X11/keysym.h>
+#include <X11/Xutil.h> // Для XTextProperty
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-// Глобальные переменные
 Display* dpy = NULL;
 Window root_win;
 Window ghost_window = None;
-unsigned int current_alpha = 128; // 0-255 для удобства, внутри конвертируем
+unsigned int current_alpha = 128;
 
-// Атомы (константы X11 для свойств окон)
 Atom OPACITY_ATOM;
 Atom STATE_ATOM;
 Atom STATE_ABOVE_ATOM;
+Atom WM_STATE_ATOM;
 
-// Обработчик ошибок, чтобы программа не падала, если окно исчезнет во время работы
 int XErrorHandlerImpl(Display *display, XErrorEvent *event) {
     return 0; 
 }
 
-// Функция для поиска главного окна под курсором (аналог GetAncestor(..., GA_ROOT))
-Window get_toplevel_window(Window start_win) {
-    Window parent;
-    Window root_return;
-    Window *children;
-    unsigned int nchildren;
-    Window current = start_win;
-
-    while (true) {
-        if (current == 0 || current == root_win) return current;
-
-        // Получаем родителя
-        if (XQueryTree(dpy, current, &root_return, &parent, &children, &nchildren) == 0) {
-            return None;
-        }
-        if (children) XFree(children);
-
-        // Если родитель - это корневое окно (рабочий стол), значит current - это главное окно приложения
-        if (parent == root_win) {
-            return current;
-        }
-        current = parent;
+// Функция получения имени окна (для отладки)
+void print_window_name(Window w) {
+    XTextProperty name;
+    if (XGetWMName(dpy, w, &name)) {
+        printf("Target Window Name: %s\n", (char*)name.value);
+        XFree(name.value);
+    } else {
+        printf("Target Window Name: (Unknown)\n");
     }
 }
 
-// Установка прозрачности (аналог LWA_ALPHA)
-void set_opacity(Window win, unsigned int alpha_255) {
-    // В X11 непрозрачность это 32-битное число (0 - min, 0xFFFFFFFF - max)
-    unsigned long opacity = (unsigned long)alpha_255 * 0x01010101;
-    if (alpha_255 == 255) opacity = 0xFFFFFFFF; 
+// Рекурсивный поиск "Клиентского" окна (настоящего приложения) внутри рамки WM
+Window find_client_window(Window w) {
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
 
-    // Изменяем свойство _NET_WM_WINDOW_OPACITY
-    XChangeProperty(dpy, win, OPACITY_ATOM, XA_CARDINAL, 32,
-                    PropModeReplace, (unsigned char *)&opacity, 1);
+    // Проверяем, есть ли у окна свойство WM_STATE. Если есть - это приложение.
+    if (XGetWindowProperty(dpy, w, WM_STATE_ATOM, 0, 0, False, AnyPropertyType,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
+        if (prop) XFree(prop);
+        if (actual_type != None) {
+            return w; // Нашли!
+        }
+    }
+
+    // Если нет, ищем среди детей
+    Window root, parent;
+    Window *children;
+    unsigned int nchildren;
+    if (XQueryTree(dpy, w, &root, &parent, &children, &nchildren) != 0) {
+        Window result = None;
+        // Перебираем детей (обычно их немного у рамки, часто всего один)
+        for (unsigned int i = 0; i < nchildren; i++) {
+            result = find_client_window(children[i]);
+            if (result != None) break;
+        }
+        if (children) XFree(children);
+        return result;
+    }
+
+    return None;
 }
 
-// Установка "поверх всех окон" (аналог HWND_TOPMOST)
+void set_opacity(Window win, unsigned int alpha_255) {
+    unsigned long opacity = (unsigned long)((double)alpha_255 / 255.0 * 0xFFFFFFFF);
+    XChangeProperty(dpy, win, OPACITY_ATOM, XA_CARDINAL, 32,
+                    PropModeReplace, (unsigned char *)&opacity, 1);
+    XFlush(dpy);
+}
+
 void set_topmost(Window win, bool enable) {
     XEvent xev;
+    memset(&xev, 0, sizeof(xev));
     xev.type = ClientMessage;
-    xev.xclient.type = ClientMessage;
     xev.xclient.window = win;
     xev.xclient.message_type = STATE_ATOM;
     xev.xclient.format = 32;
-    xev.xclient.data.l[0] = enable ? 1 : 0; // 1 = добавить, 0 = убрать
+    xev.xclient.data.l[0] = enable ? 1 : 0; // 1 = add, 0 = remove
     xev.xclient.data.l[1] = STATE_ABOVE_ATOM;
     xev.xclient.data.l[2] = 0;
-    xev.xclient.data.l[3] = 0;
+    xev.xclient.data.l[3] = 1; // source indication (1 = normal app)
     xev.xclient.data.l[4] = 0;
 
     XSendEvent(dpy, root_win, False, SubstructureRedirectMask | SubstructureNotifyMask, &xev);
     XFlush(dpy);
 }
 
-// Включение/выключение режима клика насквозь (аналог WS_EX_TRANSPARENT)
 void set_click_through(Window win, bool enable) {
     if (enable) {
-        // Устанавливаем "Input Shape" в пустой регион (None). Мышь проваливается.
         XRectangle rect;
         XserverRegion region = XFixesCreateRegion(dpy, &rect, 0);
         XFixesSetWindowShapeRegion(dpy, win, ShapeInput, 0, 0, region);
         XFixesDestroyRegion(dpy, region);
     } else {
-        // Возвращаем дефолтную область ввода (сбрасываем маску)
         XFixesSetWindowShapeRegion(dpy, win, ShapeInput, 0, 0, None);
     }
+    XFlush(dpy);
 }
 
 void toggle_ghost_mode() {
     if (ghost_window != None) {
-        // --- Выключение призрачного режима ---
-        
-        // 1. Убираем TopMost
+        // OFF
         set_topmost(ghost_window, false);
-        
-        // 2. Возвращаем кликабельность
         set_click_through(ghost_window, false);
-
-        // 3. Возвращаем полную непрозрачность (удаляем свойство opacity)
         XDeleteProperty(dpy, ghost_window, OPACITY_ATOM);
+        XFlush(dpy);
 
         ghost_window = None;
         printf("Ghost mode OFF\n");
         return;
     }
 
-    // --- Включение призрачного режима ---
-
-    // 1. Узнаем, где мышь
+    // ON
     Window root_return, child_return;
     int root_x, root_y, win_x, win_y;
     unsigned int mask;
+    
+    // Получаем окно верхнего уровня (рамку), над которым мышь
     XQueryPointer(dpy, root_win, &root_return, &child_return, &root_x, &root_y, &win_x, &win_y, &mask);
 
-    if (child_return == None) return; // Мышь над пустым столом
+    if (child_return == None || child_return == root_win) {
+        printf("Error: No window found under mouse.\n");
+        return;
+    }
 
-    // 2. Ищем главное окно
-    Window target_win = get_toplevel_window(child_return);
-    if (target_win == None || target_win == root_win) return;
-
-    // 3. Применяем настройки
-    // Always on top
-    set_topmost(target_win, true);
+    // Ищем настоящее окно приложения внутри рамки
+    Window client_win = find_client_window(child_return);
     
-    // Прозрачность
-    set_opacity(target_win, current_alpha);
-    
-    // Клик насквозь
-    set_click_through(target_win, true);
+    // Если не нашли внутри, пробуем применить к самой рамке (child_return)
+    Window target = (client_win != None) ? client_win : child_return;
 
-    ghost_window = target_win;
+    if (target == None) return;
+
+    print_window_name(target); // Пишем в консоль, что нашли
+
+    set_topmost(target, true);
+    set_opacity(target, current_alpha);
+    set_click_through(target, true);
+
+    ghost_window = target;
     printf("Ghost mode ON. Window ID: 0x%lX\n", ghost_window);
 }
 
 int main() {
-    // Подключаемся к X серверу
     dpy = XOpenDisplay(NULL);
-    if (!dpy) {
-        fprintf(stderr, "Cannot open display\n");
-        return 1;
-    }
+    if (!dpy) return 1;
 
-    // Инициализация переменных
     root_win = DefaultRootWindow(dpy);
     XSetErrorHandler(XErrorHandlerImpl);
 
-    // Получаем атомы для управления окнами (стандарт EWMH)
     OPACITY_ATOM = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
     STATE_ATOM = XInternAtom(dpy, "_NET_WM_STATE", False);
     STATE_ABOVE_ATOM = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+    WM_STATE_ATOM = XInternAtom(dpy, "WM_STATE", False);
 
-    // --- Регистрация хоткеев (Global Hooks) ---
-    
-    // 1. Хоткей Ctrl+Shift+A
-    // Получаем код клавиши 'A'
+    // Grab Hotkey Ctrl+Shift+A
     KeyCode key_a = XKeysymToKeycode(dpy, XK_A);
-    // XGrabKey перехватывает нажатие глобально
     XGrabKey(dpy, key_a, ControlMask | ShiftMask, root_win, True, GrabModeAsync, GrabModeAsync);
-    // Часто NumLock/CapsLock мешают, поэтому грабим комбинации с ними тоже (для надежности)
-    XGrabKey(dpy, key_a, ControlMask | ShiftMask | Mod2Mask, root_win, True, GrabModeAsync, GrabModeAsync); // +NumLock
+    XGrabKey(dpy, key_a, ControlMask | ShiftMask | Mod2Mask, root_win, True, GrabModeAsync, GrabModeAsync);
 
-    // 2. Мышь (Alt + Колесико)
-    // Button4 = Scroll Up, Button5 = Scroll Down
-    // Mod1Mask = Alt
+    // Grab Mouse Alt+Scroll
     XGrabButton(dpy, Button4, Mod1Mask, root_win, False, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
     XGrabButton(dpy, Button5, Mod1Mask, root_win, False, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
-    // То же самое для Alt+NumLock
     XGrabButton(dpy, Button4, Mod1Mask | Mod2Mask, root_win, False, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
     XGrabButton(dpy, Button5, Mod1Mask | Mod2Mask, root_win, False, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
 
-
-    printf("Running... Press Ctrl+Shift+A to toggle ghost mode.\n");
-    printf("Hold Alt + Scroll to change opacity.\n");
+    printf("Ready. Use Ctrl+Shift+A.\n");
 
     XEvent ev;
     while (true) {
         XNextEvent(dpy, &ev);
 
-        // Обработка клавиш (Ctrl+Shift+A)
-        if (ev.type == KeyPress) {
-            if (ev.xkey.keycode == key_a) {
-                toggle_ghost_mode();
-            }
+        if (ev.type == KeyPress && ev.xkey.keycode == key_a) {
+            toggle_ghost_mode();
         }
 
-        // Обработка мыши (Колесико с зажатым Alt)
         if (ev.type == ButtonPress && ghost_window != None) {
             bool changed = false;
-            if (ev.xbutton.button == Button4) { // Scroll Up
+            if (ev.xbutton.button == Button4) { // Up
                 if (current_alpha < 240) current_alpha += 15;
                 else current_alpha = 255;
                 changed = true;
-            } else if (ev.xbutton.button == Button5) { // Scroll Down
+            } else if (ev.xbutton.button == Button5) { // Down
                 if (current_alpha > 15) current_alpha -= 15;
                 else current_alpha = 0;
                 changed = true;
@@ -206,7 +199,5 @@ int main() {
             }
         }
     }
-
-    XCloseDisplay(dpy);
     return 0;
 }
